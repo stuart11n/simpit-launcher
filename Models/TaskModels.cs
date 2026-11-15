@@ -110,25 +110,26 @@ public sealed class TaskEntry
     private string ShellySummary()
     {
         var ip = ResolveShellyIp();
-        return string.IsNullOrWhiteSpace(ip) ? "(no IP)" : $"http://{ip}/relay/0?turn=on|off";
+        return string.IsNullOrWhiteSpace(ip) ? "(no host)" : $"http://{ip}/relay/0?turn=on|off";
     }
 
     /// <summary>
-    /// Shelly IP from <see cref="IpAddress"/>, or extracted from legacy Start/Stop webhook URLs.
+    /// Shelly host (IP or DNS) from <see cref="IpAddress"/>, or from legacy Start/Stop webhook URLs.
     /// </summary>
     public string ResolveShellyIp()
     {
         var direct = (IpAddress ?? string.Empty).Trim();
-        if (!string.IsNullOrWhiteSpace(direct) && System.Net.IPAddress.TryParse(direct, out _))
+        if (!string.IsNullOrWhiteSpace(direct) && IsValidShellyHost(direct))
         {
             return direct;
         }
 
-        return TryExtractIpFromUrl(StartUrl) ?? TryExtractIpFromUrl(StopUrl) ?? string.Empty;
+        return TryExtractHostFromUrl(StartUrl) ?? TryExtractHostFromUrl(StopUrl) ?? string.Empty;
     }
 
     /// <summary>
-    /// Copies a valid IP from legacy Start/Stop URLs into <see cref="IpAddress"/> when missing.
+    /// Copies a valid host from legacy Start/Stop URLs into <see cref="IpAddress"/> when missing.
+    /// Skips migration when start and stop hosts disagree.
     /// </summary>
     public bool TryMigrateShellyIpFromUrls()
     {
@@ -137,17 +138,26 @@ public sealed class TaskEntry
             return false;
         }
 
-        var ip = ResolveShellyIp();
-        if (string.IsNullOrWhiteSpace(ip))
+        var fromStart = TryExtractHostFromUrl(StartUrl);
+        var fromStop = TryExtractHostFromUrl(StopUrl);
+        if (!string.IsNullOrWhiteSpace(fromStart) &&
+            !string.IsNullOrWhiteSpace(fromStop) &&
+            !string.Equals(fromStart, fromStop, StringComparison.OrdinalIgnoreCase))
         {
             return false;
         }
 
-        IpAddress = ip;
+        var host = !string.IsNullOrWhiteSpace(fromStart) ? fromStart : fromStop;
+        if (string.IsNullOrWhiteSpace(host))
+        {
+            return false;
+        }
+
+        IpAddress = host;
         return true;
     }
 
-    private static string? TryExtractIpFromUrl(string? url)
+    private static string? TryExtractHostFromUrl(string? url)
     {
         var text = (url ?? string.Empty).Trim();
         if (string.IsNullOrEmpty(text))
@@ -162,7 +172,24 @@ public sealed class TaskEntry
         }
 
         var host = uri.Host;
-        return System.Net.IPAddress.TryParse(host, out _) ? host : null;
+        return IsValidShellyHost(host) ? host : null;
+    }
+
+    public static bool IsValidShellyHost(string host)
+    {
+        if (string.IsNullOrWhiteSpace(host) || host.Length > 253)
+        {
+            return false;
+        }
+
+        if (host.Contains('/') || host.Contains(' ') || host.Contains('\\'))
+        {
+            return false;
+        }
+
+        return Uri.CheckHostName(host) is UriHostNameType.IPv4
+            or UriHostNameType.IPv6
+            or UriHostNameType.Dns;
     }
 
     private string ComSummary()

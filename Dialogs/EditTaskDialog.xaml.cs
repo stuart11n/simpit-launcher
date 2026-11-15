@@ -80,15 +80,15 @@ public sealed partial class EditTaskDialog : ContentDialog
         var kind = ParseEnum(GetSelectedTag(KindBox), TaskKind.Executable);
         if (kind == TaskKind.Shelly)
         {
-            var ip = NormalizeIpInput(ShellyIpBox.Text);
-            if (!System.Net.IPAddress.TryParse(ip, out _))
+            var host = NormalizeIpInput(ShellyIpBox.Text);
+            if (!TaskEntry.IsValidShellyHost(host))
             {
                 args.Cancel = true;
                 ShellyIpBox.Focus(FocusState.Programmatic);
                 return;
             }
 
-            ShellyIpBox.Text = ip;
+            ShellyIpBox.Text = host;
         }
 
         if (kind == TaskKind.ComCommand)

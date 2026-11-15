@@ -81,10 +81,10 @@
             <StackPanel x:Name="ShellyPanel" Spacing="10" Visibility="Collapsed">
                 <TextBox
                     x:Name="ShellyIpBox"
-                    Header="IP address"
+                    Header="IP address or hostname"
                     PlaceholderText="192.168.1.50" />
                 <TextBlock
-                    Text="Start: http://&lt;IP&gt;/relay/0?turn=on&#x0a;Stop: http://&lt;IP&gt;/relay/0?turn=off"
+                    Text="Start: http://&lt;host&gt;/relay/0?turn=on&#x0a;Stop: http://&lt;host&gt;/relay/0?turn=off"
                     TextWrapping="Wrap"
                     Opacity="0.8"
                     FontSize="12" />

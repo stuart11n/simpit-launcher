@@ -128,24 +128,21 @@ bin\x64\Debug\net9.0-windows10.0.26100.0\win-x64\SimpitLauncher.exe
 
 ## Installer
 
-Unpackaged WinUI: self-contained publish bundles .NET and Windows App SDK, then optionally wrap with Inno Setup.
+Unpackaged WinUI: self-contained publish bundles .NET and Windows App SDK, then wraps with Inno Setup.
 
-### 1) Publish
+Version stamp matches HUD/s16n-scope: **`YYYYMMDD-<7-char git hash>`** (UTC), e.g. `20261115-e68537f`.
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\publish.ps1
+powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1
 ```
 
-Output: `artifacts\publish\win-x64\`
+Outputs:
 
-`publish.ps1` cleans before publish (so the merged WinUI `.pri` regenerates), and verifies `SimpitLauncher.pri` plus `.xbf` files are present.
+- `artifacts\publish\win-x64\`
+- `artifacts\installer\SimpitLauncherSetup-<version>.exe`
+- `artifacts\installer\SimpitLauncherSetup.exe` (same file, stable name)
 
-### 2) Optional Setup.exe (Inno Setup 6)
-
-- https://jrsoftware.org/isinfo.php
-- Run `publish.ps1`, then build `installer\SimpitLauncher.iss`
-
-Output: `artifacts\installer\SimpitLauncherSetup.exe`
+`publish.ps1` alone publishes the folder without building the installer. Requires [Inno Setup 6](https://jrsoftware.org/isinfo.php) for `package.ps1`.
 
 ## GitHub Actions
 
@@ -153,27 +150,14 @@ Workflow: `.github/workflows/build.yml`
 
 On push/PR to `master` or `main` (and **Run workflow**):
 
-1. Restore and build Release x64
-2. `publish.ps1` (self-contained win-x64)
-3. Build `SimpitLauncherSetup.exe`
+1. Resolve version stamp `YYYYMMDD-<hash>`
+2. Restore / build Release x64
+3. `scripts\package.ps1` (self-contained win-x64 + Setup.exe)
 4. Upload artifacts:
    - `SimpitLauncher-win-x64`
    - `SimpitLauncherSetup`
 
-**Actions** → workflow run → **Artifacts**.
-
-### Draft release from a version tag
-
-Push a semver tag to cut a **draft** GitHub Release (installer + zip attached):
-
-```powershell
-git tag v1.0.0
-git push origin v1.0.0
-```
-
-Then open **Releases**, review the draft notes/assets, and click **Publish release**.
-
-The installer `AppVersion` is taken from the tag (e.g. `v1.2.3` → `1.2.3`).
+On push to `master`/`main`, also updates the rolling GitHub Release tag **`latest`** (installer + zip), same pattern as HUD’s `hud-latest`.
 
 ## License
 

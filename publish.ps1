@@ -25,6 +25,10 @@ if ($LASTEXITCODE -ne 0) {
     throw "dotnet clean failed with exit code $LASTEXITCODE"
 }
 
+$versionScript = Join-Path $root "scripts\Get-VersionStamp.ps1"
+$version = & $versionScript -RepoRoot $root
+Write-Host "Version stamp: $version"
+
 Write-Host "Publishing self-contained win-x64 ($Configuration)..."
 dotnet publish .\SimpitLauncher.csproj `
     -c $Configuration `
@@ -35,6 +39,8 @@ dotnet publish .\SimpitLauncher.csproj `
     -p:IncludeNativeLibrariesForSelfExtract=true `
     -p:WindowsAppSDKSelfContained=true `
     -p:WindowsPackageType=None `
+    -p:InformationalVersion=$version `
+    -p:Version=0.0.0 `
     -o $outDir
 
 if ($LASTEXITCODE -ne 0) {

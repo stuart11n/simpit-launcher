@@ -52,6 +52,8 @@ public static class WindowsProtectionService
         SetUsbPowerSavingEnabledCore(enabled);
     }
 
+    private static readonly object ElevatedJobGate = new();
+
     private static string ElevatedErrorFilePath =>
         Path.Combine(Path.GetTempPath(), "simpit-launcher-elevated-error.txt");
 
@@ -374,6 +376,15 @@ public static class WindowsProtectionService
     }
 
     private static void RunElevatedJobAndWait(string job)
+    {
+        // Serialize elevated helper processes — they share one temp error file.
+        lock (ElevatedJobGate)
+        {
+            RunElevatedJobAndWaitCore(job);
+        }
+    }
+
+    private static void RunElevatedJobAndWaitCore(string job)
     {
         var exe = Environment.ProcessPath;
         if (string.IsNullOrWhiteSpace(exe) || !File.Exists(exe))

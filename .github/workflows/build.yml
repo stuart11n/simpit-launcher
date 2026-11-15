@@ -3,7 +3,6 @@ name: Build
 on:
   push:
     branches: [master, main]
-    tags: ["v*.*.*"]
   pull_request:
     branches: [master, main]
   workflow_dispatch:
@@ -24,27 +23,27 @@ jobs:
         with:
           dotnet-version: "9.0.x"
 
-      - name: Resolve version from tag
+      - name: Resolve version stamp
         id: version
         shell: pwsh
         run: |
-          if ($env:GITHUB_REF_TYPE -eq "tag" -and $env:GITHUB_REF_NAME -match '^v(?<ver>\d+\.\d+\.\d+)') {
-            $ver = $Matches.ver
-          } else {
-            $ver = "1.0.0"
-          }
+          $ver = & .\scripts\Get-VersionStamp.ps1
           "version=$ver" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
-          Write-Host "Installer version: $ver"
+          Write-Host "Version stamp: $ver"
 
       - name: Restore
         run: dotnet restore .\SimpitLauncher.csproj -p:Platform=x64
 
       - name: Build
-        run: dotnet build .\SimpitLauncher.csproj -c Release -p:Platform=x64 --no-restore
+        run: dotnet build .\SimpitLauncher.csproj -c Release -p:Platform=x64 --no-restore -p:InformationalVersion=${{ steps.version.outputs.version }}
 
-      - name: Publish self-contained (win-x64)
+      - name: Install Inno Setup
+        run: choco install innosetup -y --no-progress
+
+      - name: Publish + installer
+        shell: pwsh
         run: |
-          powershell -ExecutionPolicy Bypass -File .\publish.ps1 -Configuration Release
+          powershell -ExecutionPolicy Bypass -File .\scripts\package.ps1 -Configuration Release -Version "${{ steps.version.outputs.version }}"
 
       - name: Upload publish folder
         uses: actions/upload-artifact@v4
@@ -53,37 +52,50 @@ jobs:
           path: artifacts/publish/win-x64
           if-no-files-found: error
 
-      - name: Install Inno Setup
-        run: choco install innosetup -y --no-progress
-
-      - name: Build installer
-        shell: cmd
-        run: |
-          "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer\SimpitLauncher.iss /DMyAppVersion=%VERSION%
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-
       - name: Upload installer
         uses: actions/upload-artifact@v4
         with:
           name: SimpitLauncherSetup
-          path: artifacts/installer/SimpitLauncherSetup.exe
+          path: |
+            artifacts/installer/SimpitLauncherSetup.exe
+            artifacts/installer/SimpitLauncherSetup-${{ steps.version.outputs.version }}.exe
           if-no-files-found: error
 
       - name: Zip publish folder for release
-        if: startsWith(github.ref, 'refs/tags/v')
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
         shell: pwsh
         run: |
           Compress-Archive -Path artifacts\publish\win-x64\* `
             -DestinationPath artifacts\SimpitLauncher-win-x64.zip -Force
 
-      - name: Create draft GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          draft: true
-          generate_release_notes: true
-          name: Simpit Launcher ${{ github.ref_name }}
-          files: |
-            artifacts/installer/SimpitLauncherSetup.exe
-            artifacts/SimpitLauncher-win-x64.zip
+      - name: Publish latest GitHub Release
+        if: github.event_name == 'push' && (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $tag = "latest"
+          $title = "Simpit Launcher (latest)"
+          $setup = "artifacts/installer/SimpitLauncherSetup.exe"
+          $zip = "artifacts/SimpitLauncher-win-x64.zip"
+          $notes = @"
+          Windows x64 installer for Simpit Launcher $env:VERSION.
+
+          Source: $($env:GITHUB_REPOSITORY)@$($env:GITHUB_SHA)
+          "@
+          $notesFile = "artifacts/release-notes.md"
+          Set-Content -Path $notesFile -Value $notes.Trim() -Encoding utf8
+
+          $exists = $true
+          gh release view $tag 2>$null | Out-Null
+          if ($LASTEXITCODE -ne 0) { $exists = $false }
+
+          if ($exists) {
+            gh release edit $tag --title $title --notes-file $notesFile
+            gh release upload $tag $setup $zip --clobber
+          } else {
+            gh release create $tag $setup $zip --title $title --notes-file $notesFile
+          }
+
+          Write-Host "Published $tag ($env:VERSION)"

@@ -114,8 +114,9 @@ public sealed partial class MainPage : Page
 
     private async Task ApplyLaunchPerformanceRestoreAsync(CommandLineOptions options)
     {
-        // CLI --start/--stop already run the full sequence; avoid double UAC / conflicting actions.
-        if (options.Start || options.Stop)
+        // Pure --stop already runs builtin stop actions; skip to avoid double UAC.
+        // --start (including after a crash) still restores first so the session starts clean.
+        if (options.Stop && !options.Start)
         {
             return;
         }
@@ -128,7 +129,8 @@ public sealed partial class MainPage : Page
                 && t.BuiltinAction is BuiltinAction.MaxCpuPerformance
                     or BuiltinAction.MaxGpuPerformance
                     or BuiltinAction.DisableFirewall
-                    or BuiltinAction.DisableRealtimeScanning)
+                    or BuiltinAction.DisableRealtimeScanning
+                    or BuiltinAction.DisableUsbPowerSaving)
             .Select(t =>
             {
                 var copy = t.Clone();
@@ -142,12 +144,44 @@ public sealed partial class MainPage : Page
             return;
         }
 
-        await Task.Yield();
-        AppendLog("--- Launch: restore system options (stop actions) ---");
-
-        foreach (var entry in toRestore)
+        if (_busy)
         {
-            await RunSingleEntryAsync(entry, starting: false);
+            return;
+        }
+
+        await Task.Yield();
+        _busy = true;
+        SetButtonsEnabled(false);
+        AppendLog("--- Launch: restore system options (stop actions) ---");
+        try
+        {
+            foreach (var entry in toRestore)
+            {
+                BeginProgress(1, $"Restore {entry.Name}…");
+                AppendLog($"--- STOP entry: {entry.Name} ---");
+                var progress = new Progress<string>(line =>
+                {
+                    UpdateProgress(1, 1, line);
+                    AppendLog(line);
+                });
+                try
+                {
+                    var line = await _runner.RunSingleStopAsync(entry, progress);
+                    var failed = line.Contains("ERROR", StringComparison.OrdinalIgnoreCase);
+                    CompleteProgress(failed ? $"STOP failed ({entry.Name})" : $"STOP complete ({entry.Name})");
+                }
+                catch (Exception ex)
+                {
+                    CompleteProgress($"STOP failed: {ex.Message}");
+                    AppendLog($"STOP failed: {ex.Message}");
+                }
+            }
+        }
+        finally
+        {
+            SetButtonsEnabled(true);
+            _busy = false;
+            _ = RefreshSystemStatusAsync();
         }
     }
 
@@ -160,6 +194,11 @@ public sealed partial class MainPage : Page
 
         // Let the UI finish laying out before running long actions.
         await Task.Yield();
+
+        if (options.Start && options.Stop)
+        {
+            AppendLog("CLI: both --start and --stop specified; running START then STOP");
+        }
 
         if (options.Start)
         {
@@ -179,6 +218,9 @@ public sealed partial class MainPage : Page
             App.MainWindow?.ForceExit();
         }
     }
+
+    private static bool CountsTowardProgress(string line) =>
+        !line.StartsWith("SCHEDULED ", StringComparison.OrdinalIgnoreCase);
 
     private void ViewSelector_SelectionChanged(SelectorBar sender, SelectorBarSelectionChangedEventArgs args)
     {
@@ -315,9 +357,15 @@ public sealed partial class MainPage : Page
         var completed = 0;
         var progress = new Progress<string>(line =>
         {
+            AppendLog(line);
+            if (!CountsTowardProgress(line))
+            {
+                UpdateProgress(completed, total, line);
+                return;
+            }
+
             completed++;
             UpdateProgress(completed, total, line);
-            AppendLog(line);
         });
         try
         {
@@ -354,9 +402,15 @@ public sealed partial class MainPage : Page
         var completed = 0;
         var progress = new Progress<string>(line =>
         {
+            AppendLog(line);
+            if (!CountsTowardProgress(line))
+            {
+                UpdateProgress(completed, total, line);
+                return;
+            }
+
             completed++;
             UpdateProgress(completed, total, line);
-            AppendLog(line);
         });
         try
         {

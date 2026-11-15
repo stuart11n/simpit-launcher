@@ -12,12 +12,16 @@ public sealed class TaskRunner
         Timeout = TimeSpan.FromSeconds(15)
     };
 
+    /// <summary>Serializes builtins so delayed elevated jobs don't overlap UAC / error files.</summary>
+    private static readonly SemaphoreSlim BuiltinGate = new(1, 1);
+
     private const string HighPerfGuid = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
     private const string BalancedGuid = "381b4222-f694-41f0-9685-ff5bb260df2e";
 
     public async Task<string> RunStartAsync(IEnumerable<TaskEntry> tasks, IProgress<string>? progress = null, CancellationToken ct = default)
     {
         var log = new StringBuilder();
+        var deferred = new List<Task>();
         foreach (var task in tasks.Where(t => t.Enabled))
         {
             ct.ThrowIfCancellationRequested();
@@ -25,7 +29,7 @@ public sealed class TaskRunner
             {
                 if (task.DelaySeconds > 0)
                 {
-                    ScheduleDeferred(task, starting: true, log, progress, ct);
+                    deferred.Add(ScheduleDeferred(task, starting: true, log, progress, ct));
                     continue;
                 }
 
@@ -38,12 +42,18 @@ public sealed class TaskRunner
             }
         }
 
+        if (deferred.Count > 0)
+        {
+            await Task.WhenAll(deferred).ConfigureAwait(false);
+        }
+
         return log.ToString();
     }
 
     public async Task<string> RunStopAsync(IEnumerable<TaskEntry> tasks, IProgress<string>? progress = null, CancellationToken ct = default)
     {
         var log = new StringBuilder();
+        var deferred = new List<Task>();
         foreach (var task in tasks.Where(t => t.Enabled))
         {
             ct.ThrowIfCancellationRequested();
@@ -51,7 +61,7 @@ public sealed class TaskRunner
             {
                 if (task.DelaySeconds > 0)
                 {
-                    ScheduleDeferred(task, starting: false, log, progress, ct);
+                    deferred.Add(ScheduleDeferred(task, starting: false, log, progress, ct));
                     continue;
                 }
 
@@ -69,6 +79,11 @@ public sealed class TaskRunner
             }
         }
 
+        if (deferred.Count > 0)
+        {
+            await Task.WhenAll(deferred).ConfigureAwait(false);
+        }
+
         return log.ToString();
     }
 
@@ -79,7 +94,7 @@ public sealed class TaskRunner
             if (task.DelaySeconds > 0)
             {
                 var log = new StringBuilder();
-                ScheduleDeferred(task, starting: true, log, progress, ct);
+                await ScheduleDeferred(task, starting: true, log, progress, ct).ConfigureAwait(false);
                 return log.ToString().TrimEnd();
             }
 
@@ -102,7 +117,7 @@ public sealed class TaskRunner
             if (task.DelaySeconds > 0)
             {
                 var log = new StringBuilder();
-                ScheduleDeferred(task, starting: false, log, progress, ct);
+                await ScheduleDeferred(task, starting: false, log, progress, ct).ConfigureAwait(false);
                 return log.ToString().TrimEnd();
             }
 
@@ -123,7 +138,7 @@ public sealed class TaskRunner
         }
     }
 
-    private static void ScheduleDeferred(
+    private static Task ScheduleDeferred(
         TaskEntry task,
         bool starting,
         StringBuilder log,
@@ -135,14 +150,14 @@ public sealed class TaskRunner
         var action = starting ? "START" : "STOP";
         Append(log, progress, $"SCHEDULED {action} [{snapshot.Name}] in {seconds}s (background)");
 
-        _ = Task.Run(async () =>
+        return Task.Run(async () =>
         {
             try
             {
                 await Task.Delay(TimeSpan.FromSeconds(seconds), ct).ConfigureAwait(false);
                 var line = starting
-                    ? await StartOneAsync(snapshot, ct).ConfigureAwait(false)
-                    : await StopOneAsync(snapshot, ct).ConfigureAwait(false);
+                    ? await StartOneAsync(snapshot, CancellationToken.None).ConfigureAwait(false)
+                    : await StopOneAsync(snapshot, CancellationToken.None).ConfigureAwait(false);
                 if (!starting && string.IsNullOrWhiteSpace(line))
                 {
                     line = $"SKIP [{snapshot.Name}]";
@@ -193,7 +208,7 @@ public sealed class TaskRunner
         }
 
         using var response = await Http.GetAsync(task.StartUrl, ct).ConfigureAwait(false);
-        return $"WEBHOOK [{task.Name}] GET {task.StartUrl} -> {(int)response.StatusCode}";
+        return FormatHttpResult("WEBHOOK", task.Name, task.StartUrl, response);
     }
 
     private static async Task<string> StopWebhookAsync(TaskEntry task, CancellationToken ct)
@@ -204,32 +219,40 @@ public sealed class TaskRunner
         }
 
         using var response = await Http.GetAsync(task.StopUrl, ct).ConfigureAwait(false);
-        return $"WEBHOOK [{task.Name}] GET {task.StopUrl} -> {(int)response.StatusCode}";
+        return FormatHttpResult("WEBHOOK", task.Name, task.StopUrl, response);
     }
 
     private static async Task<string> StartShellyAsync(TaskEntry task, CancellationToken ct)
     {
         var url = BuildShellyUrl(task.ResolveShellyIp(), turnOn: true);
         using var response = await Http.GetAsync(url, ct).ConfigureAwait(false);
-        return $"SHELLY [{task.Name}] GET {url} -> {(int)response.StatusCode}";
+        return FormatHttpResult("SHELLY", task.Name, url, response);
     }
 
     private static async Task<string> StopShellyAsync(TaskEntry task, CancellationToken ct)
     {
         var url = BuildShellyUrl(task.ResolveShellyIp(), turnOn: false);
         using var response = await Http.GetAsync(url, ct).ConfigureAwait(false);
-        return $"SHELLY [{task.Name}] GET {url} -> {(int)response.StatusCode}";
+        return FormatHttpResult("SHELLY", task.Name, url, response);
     }
 
-    private static string BuildShellyUrl(string ipAddress, bool turnOn)
+    private static string FormatHttpResult(string kind, string name, string url, HttpResponseMessage response)
     {
-        var ip = (ipAddress ?? string.Empty).Trim();
-        if (string.IsNullOrWhiteSpace(ip) || !System.Net.IPAddress.TryParse(ip, out _))
+        var code = (int)response.StatusCode;
+        return response.IsSuccessStatusCode
+            ? $"{kind} [{name}] GET {url} -> {code}"
+            : $"ERROR [{name}] {kind} GET {url} -> {code}";
+    }
+
+    private static string BuildShellyUrl(string host, bool turnOn)
+    {
+        var value = (host ?? string.Empty).Trim();
+        if (string.IsNullOrWhiteSpace(value) || !TaskEntry.IsValidShellyHost(value))
         {
-            throw new InvalidOperationException("Shelly task requires a valid IP address.");
+            throw new InvalidOperationException("Shelly task requires a valid IP address or hostname.");
         }
 
-        return $"http://{ip}/relay/0?turn={(turnOn ? "on" : "off")}";
+        return $"http://{value}/relay/0?turn={(turnOn ? "on" : "off")}";
     }
 
     private static async Task<string> RunComCommandAsync(TaskEntry task, bool starting, CancellationToken ct)
@@ -418,86 +441,87 @@ public sealed class TaskRunner
             return $"SKIP [{task.Name}] stop action disabled";
         }
 
-        switch (task.BuiltinAction)
+        await BuiltinGate.WaitAsync(ct).ConfigureAwait(false);
+        try
         {
-            case BuiltinAction.DisableFirewall:
-                {
-                    // Session START disables firewall; session STOP re-enables it (matches flight.bat / off.bat).
-                    if (starting)
+            switch (task.BuiltinAction)
+            {
+                case BuiltinAction.DisableFirewall:
                     {
-                        WindowsProtectionService.SetFirewallEnabled(false);
-                        return $"START ACTION [{task.Name}] firewall OFF (INetFwPolicy2)";
-                    }
-                    else
-                    {
+                        // Session START disables firewall; session STOP re-enables it (matches flight.bat / off.bat).
+                        if (starting)
+                        {
+                            WindowsProtectionService.SetFirewallEnabled(false);
+                            return $"START ACTION [{task.Name}] firewall OFF (INetFwPolicy2)";
+                        }
+
                         WindowsProtectionService.SetFirewallEnabled(true);
                         return $"STOP ACTION [{task.Name}] firewall ON (INetFwPolicy2)";
                     }
-                }
-            case BuiltinAction.DisableRealtimeScanning:
-                {
-                    // Session START disables Defender realtime; session STOP re-enables it (matches flight.bat / off.bat).
-                    if (starting)
+                case BuiltinAction.DisableRealtimeScanning:
                     {
-                        WindowsProtectionService.SetDefenderRealtimeDisabled(disabled: true);
-                        return $"START ACTION [{task.Name}] Defender realtime OFF (MSFT_MpPreference)";
-                    }
-                    else
-                    {
+                        // Session START disables Defender realtime; session STOP re-enables it (matches flight.bat / off.bat).
+                        if (starting)
+                        {
+                            WindowsProtectionService.SetDefenderRealtimeDisabled(disabled: true);
+                            return $"START ACTION [{task.Name}] Defender realtime OFF (MSFT_MpPreference)";
+                        }
+
                         WindowsProtectionService.SetDefenderRealtimeDisabled(disabled: false);
                         return $"STOP ACTION [{task.Name}] Defender realtime ON (MSFT_MpPreference)";
                     }
-                }
-            case BuiltinAction.MaxCpuPerformance:
-                {
-                    // Same command both ways: powercfg /s <guid>
-                    var powercfg = Path.Combine(Environment.SystemDirectory, "powercfg.exe");
-                    if (starting)
+                case BuiltinAction.MaxCpuPerformance:
                     {
-                        RunProcess(powercfg, $"/s {HighPerfGuid}");
-                        return $"START ACTION [{task.Name}] powercfg /s High performance ({HighPerfGuid})";
-                    }
-                    else
-                    {
+                        // Same command both ways: powercfg /s <guid>
+                        var powercfg = Path.Combine(Environment.SystemDirectory, "powercfg.exe");
+                        if (starting)
+                        {
+                            RunProcess(powercfg, $"/s {HighPerfGuid}");
+                            return $"START ACTION [{task.Name}] powercfg /s High performance ({HighPerfGuid})";
+                        }
+
                         RunProcess(powercfg, $"/s {BalancedGuid}");
                         return $"STOP ACTION [{task.Name}] powercfg /s Balanced ({BalancedGuid})";
                     }
-                }
-            case BuiltinAction.MaxGpuPerformance:
-                {
-                    // Same command both ways: nvidia-smi -pl <watts>
-                    var watts = starting
-                        ? (task.GpuPowerLimitWatts <= 0 ? 352 : task.GpuPowerLimitWatts)
-                        : (task.GpuStopPowerLimitWatts <= 0 ? 200 : task.GpuStopPowerLimitWatts);
-                    var exit = RunElevatedProcess("nvidia-smi", $"-pl {watts}");
-                    if (exit is null)
+                case BuiltinAction.MaxGpuPerformance:
                     {
-                        throw new InvalidOperationException("UAC cancelled or failed to start nvidia-smi.");
-                    }
+                        // Same command both ways: nvidia-smi -pl <watts>
+                        var watts = starting
+                            ? (task.GpuPowerLimitWatts <= 0 ? 352 : task.GpuPowerLimitWatts)
+                            : (task.GpuStopPowerLimitWatts <= 0 ? 200 : task.GpuStopPowerLimitWatts);
+                        var exit = RunElevatedProcess("nvidia-smi", $"-pl {watts}");
+                        if (exit is null)
+                        {
+                            throw new InvalidOperationException("UAC cancelled or failed to start nvidia-smi.");
+                        }
 
-                    if (exit != 0)
+                        if (exit != 0)
+                        {
+                            throw new InvalidOperationException($"nvidia-smi exited with code {exit}.");
+                        }
+
+                        return starting
+                            ? $"START ACTION [{task.Name}] nvidia-smi -pl {watts} (exit {exit})"
+                            : $"STOP ACTION [{task.Name}] nvidia-smi -pl {watts} (exit {exit})";
+                    }
+                case BuiltinAction.DisableUsbPowerSaving:
                     {
-                        throw new InvalidOperationException($"nvidia-smi exited with code {exit}.");
-                    }
+                        if (starting)
+                        {
+                            WindowsProtectionService.SetUsbPowerSavingEnabled(false);
+                            return $"START ACTION [{task.Name}] USB power saving OFF (selective suspend + USB devices)";
+                        }
 
-                    return starting
-                        ? $"START ACTION [{task.Name}] nvidia-smi -pl {watts} (exit {exit})"
-                        : $"STOP ACTION [{task.Name}] nvidia-smi -pl {watts} (exit {exit})";
-                }
-            case BuiltinAction.DisableUsbPowerSaving:
-                {
-                    if (starting)
-                    {
-                        WindowsProtectionService.SetUsbPowerSavingEnabled(false);
-                        return $"START ACTION [{task.Name}] USB power saving OFF (selective suspend + USB devices)";
+                        WindowsProtectionService.SetUsbPowerSavingEnabled(true);
+                        return $"STOP ACTION [{task.Name}] USB power saving ON (selective suspend + USB devices)";
                     }
-
-                    WindowsProtectionService.SetUsbPowerSavingEnabled(true);
-                    return $"STOP ACTION [{task.Name}] USB power saving ON (selective suspend + USB devices)";
-                }
-            default:
-                await Task.CompletedTask.ConfigureAwait(false);
-                return $"SKIP [{task.Name}] unknown builtin";
+                default:
+                    return $"SKIP [{task.Name}] unknown builtin";
+            }
+        }
+        finally
+        {
+            BuiltinGate.Release();
         }
     }
 
@@ -660,7 +684,14 @@ public sealed class TaskRunner
             psi.Verb = "runas";
         }
 
-        Process.Start(psi);
+        try
+        {
+            Process.Start(psi);
+        }
+        catch (System.ComponentModel.Win32Exception ex) when (ex.NativeErrorCode == 1223)
+        {
+            throw new InvalidOperationException("UAC cancelled — launch was not elevated.");
+        }
     }
 
     private static void RunCommandLine(string command, bool runAsAdmin)
